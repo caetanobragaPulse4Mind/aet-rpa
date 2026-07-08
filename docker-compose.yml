@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  aet-rpa:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    networks:
+      - minha_rede
+    environment:
+      - NODE_ENV=production
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+    deploy:
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=minha_rede"
+        - "traefik.http.routers.aet-rpa.rule=Host(`aet-rpa.pulse4mind.com`)"
+        - "traefik.http.routers.aet-rpa.entrypoints=websecure"
+        - "traefik.http.routers.aet-rpa.tls.certresolver=letsencryptresolver"
+        - "traefik.http.services.aet-rpa.loadbalancer.server.port=3000"
+      replicas: 1
+      resources:
+        limits:
+          memory: 2G
+
+networks:
+  minha_rede:
+    external: true
