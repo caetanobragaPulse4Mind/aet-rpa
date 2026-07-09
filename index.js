@@ -8,7 +8,7 @@ app.use(express.json());
 // ── Health check ──────────────────────────────────────────
 // Usado pelo HEALTHCHECK do Dockerfile e para validar o deploy no Portainer/Traefik
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'online', timestamp: new Date().toISOString() });
 });
 
 // ── Rotas de negócio (placeholders) ───────────────────────
