@@ -1,16 +1,20 @@
 version: "3.8"
-
 services:
   aet-rpa:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: aet-rpa:latest
     networks:
       - minha_rede
     environment:
       - NODE_ENV=production
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_AUTH_EMAIL=${SUPABASE_AUTH_EMAIL}
+      - SUPABASE_AUTH_PASSWORD=${SUPABASE_AUTH_PASSWORD}
+      - SIAET_CODIGO_ACESSO=${SIAET_CODIGO_ACESSO}
+      - SIAET_SENHA=${SIAET_SENHA}
+      - AET_RPA_API_TOKEN=${AET_RPA_API_TOKEN}
+    volumes:
+      - aet-rpa-pdfs:/app/pdfs
     deploy:
       labels:
         - "traefik.enable=true"
@@ -23,7 +27,8 @@ services:
       resources:
         limits:
           memory: 2G
-
 networks:
   minha_rede:
     external: true
+volumes:
+  aet-rpa-pdfs:

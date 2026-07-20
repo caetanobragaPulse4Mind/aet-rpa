@@ -24,12 +24,13 @@
  *     headless, o Chromium do Playwright não tem visualizador de
  *     PDF embutido, então essa navegação dispara um evento de
  *     download automaticamente.
- *
- * AINDA NÃO TESTADO contra o site real (diferente do fluxo de
- * login). Por isso, sem retentativa automática nesta versão — se o
- * captcha for rejeitado aqui também, dá pra aplicar o mesmo padrão
- * já validado em loginSiaet, uma vez confirmado como é a tela de
- * erro nesse contexto específico.
+ *   - Quando a AET foi devolvida para correção (ou tem outra
+ *     pendência), a tela manEmitirBoleto.asp NÃO tem o botão
+ *     cmdImprimirAET — em vez disso mostra o mesmo painel de
+ *     "Situação da AET" / "Observação Análise" da tela de consulta
+ *     (conSituacaoAet.asp). Nesse caso, extraímos esses dados da
+ *     própria página (sem captcha extra) em vez de só reportar erro
+ *     genérico de URL inesperada — ver extrair_situacao_pagina.js.
  *
  * Pré-requisitos: os mesmos do siaet_login_completo.js
  *                  (este arquivo precisa estar na mesma pasta)
@@ -40,6 +41,7 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const { resolverCaptchaNaPagina } = require('./captcha_playwright.js');
 const { fazerLoginCompleto } = require('./siaet_login_completo.js');
+const { extrairSituacao, situacaoTemDados, extrairPendenciaProprietario } = require('./extrair_situacao_pagina.js');
 
 // ---------------------------------------------------------------
 // PASSO A — Buscar uma AET específica por número/ano
@@ -90,14 +92,37 @@ async function buscarAetPorNumero(page, numeroAet, anoAet) {
       continue; // goto(URL_BUSCA) no topo do próximo loop recarrega tudo
     }
 
-    // Confirma que o botão de imprimir está presente na página resultante
+    // Confirma que o botão de imprimir está presente na página resultante.
+    // Timeout de 15s: dá margem suficiente pro elemento renderizar em
+    // conexões mais lentas antes de considerar que ele realmente não existe.
     const btnImprimir = page.locator('input[name="cmdImprimirAET"]');
-    if (await btnImprimir.isVisible({ timeout: 5000 }).catch(() => false)) {
+    if (await btnImprimir.isVisible({ timeout: 15000 }).catch(() => false)) {
       console.log(`  AET encontrada na tentativa ${tentativa}.`);
       return;
     }
 
-    // URL inesperada — não é erro de captcha nem sucesso conhecido
+    // Botão não apareceu — antes de assumir erro genérico, tenta extrair
+    // o painel de "Situação da AET" da própria página (sem captcha extra).
+    // Cobre casos como AET devolvida para correção, que usa a mesma URL
+    // de sucesso (manEmitirBoleto.asp) mas sem o botão de imprimir.
+    const situacao = await extrairSituacao(page);
+    if (situacaoTemDados(situacao)) {
+      const erroSituacao = new Error(situacao.situacaoAet || 'AET com situação pendente no SIAET.');
+      erroSituacao.situacao = situacao;
+      throw erroSituacao;
+    }
+
+    // Não é devolução — tenta o outro caso conhecido: pendência de
+    // dados do proprietário da carga (manProprietarioCarga.asp).
+    const pendenciaProprietario = await extrairPendenciaProprietario(page);
+    if (pendenciaProprietario) {
+      const erroPendencia = new Error(pendenciaProprietario.situacaoAet);
+      erroPendencia.situacao = pendenciaProprietario;
+      throw erroPendencia;
+    }
+
+    // Nem captcha errado, nem sucesso, nem painel de situação reconhecido
+    // — situação realmente não mapeada ainda.
     throw new Error(`URL inesperada após submit na tentativa ${tentativa}: ${urlAtual}`);
   }
 }
@@ -164,6 +189,9 @@ if (require.main === module) {
       await imprimirAet(page, NUMERO_AET_TESTE, ANO_AET_TESTE, CAMINHO_PDF_TESTE);
     } catch (erro) {
       console.error('Falha ao imprimir AET:', erro.message);
+      if (erro.situacao) {
+        console.error('Situação extraída:', erro.situacao);
+      }
       await page.screenshot({ path: 'erro-imprimir-aet.png' });
     } finally {
       await browser.close();

@@ -3,9 +3,11 @@ FROM mcr.microsoft.com/playwright:v1.61.0-noble
 WORKDIR /app
 
 # Tesseract OCR — necessário para node-tesseract-ocr
+# Ghostscript — necessário para comprimir os PDFs das AETs (anexar_aets.js)
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-por \
+    ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
