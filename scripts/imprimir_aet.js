@@ -105,6 +105,19 @@ async function buscarAetPorNumero(page, numeroAet, anoAet) {
       continue; // navegarParaImprimir(page) no topo do próximo loop recarrega tudo, via clique real de menu
     }
 
+    // --- DEBUG TEMPORÁRIO — remover depois de diagnosticar ---
+    // Salva a URL exata + o HTML completo da página assim que chega
+    // aqui, ANTES de checar o botão. Objetivo: comparar linha a linha
+    // com o HTML salvo manualmente e achar a diferença real entre a
+    // sessão do script e a sessão manual pra mesma AET.
+    const fsDebug = require('fs');
+    fsDebug.writeFileSync(
+      `debug-pagina-${tentativa}.html`,
+      `<!-- URL: ${urlAtual} -->\n${await page.content()}`
+    );
+    console.log(`  [DEBUG] HTML salvo em debug-pagina-${tentativa}.html — URL: ${urlAtual}`);
+    // --- fim do debug temporário ---
+
     // Confirma que o botão de imprimir está presente na página resultante.
     // Timeout de 15s: dá margem suficiente pro elemento renderizar em
     // conexões mais lentas antes de considerar que ele realmente não existe.
@@ -198,7 +211,7 @@ if (require.main === module) {
   // Número/ano de teste (AET real vista no print/vídeo enviados).
   // Para uso real, troque pelos valores desejados — ou adapte para
   // ler de argumentos de linha de comando (process.argv).
-  const NUMERO_AET_TESTE = '229767';
+  const NUMERO_AET_TESTE = '289046';
   const ANO_AET_TESTE = '2026';
   const CAMINHO_PDF_TESTE = `.AETS/aet-${NUMERO_AET_TESTE}-${ANO_AET_TESTE}.pdf`;
 
