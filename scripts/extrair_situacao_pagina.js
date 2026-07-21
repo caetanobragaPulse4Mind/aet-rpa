@@ -1,124 +1,225 @@
 /**
- * Extração dos campos de "Situação da AET" — compartilhado entre
- * imprimir_aet.js (quando o cmdImprimirAET não aparece porque a AET
- * foi devolvida) e consultar_situacao_aet.js (consulta direta via
- * manSituacaoAet.asp). Os rótulos são idênticos nas duas telas, então
- * a lógica de leitura fica num lugar só.
+ * SIAET (DNIT) — Buscar AET por número/ano e baixar o PDF
  *
- * Abordagem: em vez de navegar a árvore do DOM célula por célula
- * (locator + xpath de célula vizinha), lê o texto renderizado da
- * página inteira (innerText) e localiza os rótulos linha por linha.
- * Essas páginas ASP antigas têm marcação bem inconsistente (fonts
- * aninhadas, divs de alinhamento, atributos malformados — o mesmo
- * padrão de "aspas soltas" já visto nos botões de submit) então
- * depender da estrutura exata de <td>/<tr> é frágil. innerText já
- * reflete o texto como o navegador renderiza, então é resistente a
- * essas variações de marcação.
+ * Fluxo coberto:
+ *   1. Faz login (reaproveita siaet_login_completo.js)
+ *   2. Navega até "AET > Imprimir" (manAet.asp?op=emt)
+ *   3. Preenche número da AET + ano
+ *   4. Resolve o CAPTCHA numérico (mesmo padrão do login)
+ *   5. Envia o formulário e chega na tela "Emitir Boleto"
+ *   6. Clica em "Imprimir AET" — abre um popup que serve o PDF
+ *   7. Captura o evento de download e salva o arquivo localmente
+ *
+ * Confirmado via HTML real:
+ *   - O captcha aqui é o MESMO padrão de 5 dígitos do login (mesma
+ *     imagem id="captcha"). Único campo de destino diferente: aqui
+ *     só tem `name="securityCode"`, sem `id` como no login.
+ *   - O botão "Enviar" é um <input type="image"> — o atributo
+ *     `name` veio malformado no HTML real (aspas soltas), por isso
+ *     o seletor usado é por tipo, não por nome.
+ *   - O botão "Imprimir AET" (cmdImprimirAET) chama uma função JS
+ *     própria do site (OpenModalWindow) que por baixo é um
+ *     window.open() — abre como janela popup separada, apontando
+ *     direto para um endpoint que serve o PDF puro. Em modo
+ *     headless, o Chromium do Playwright não tem visualizador de
+ *     PDF embutido, então essa navegação dispara um evento de
+ *     download automaticamente.
+ *   - Quando a AET foi devolvida para correção (ou tem outra
+ *     pendência), a tela manEmitirBoleto.asp NÃO tem o botão
+ *     cmdImprimirAET — em vez disso mostra o mesmo painel de
+ *     "Situação da AET" / "Observação Análise" da tela de consulta
+ *     (conSituacaoAet.asp). Nesse caso, extraímos esses dados da
+ *     própria página (sem captcha extra) em vez de só reportar erro
+ *     genérico de URL inesperada — ver extrair_situacao_pagina.js.
+ *
+ * Pré-requisitos: os mesmos do siaet_login_completo.js
+ *                  (este arquivo precisa estar na mesma pasta)
  */
 
-// Rótulos conhecidos, na ordem em que aparecem nas duas telas.
-// Usado tanto pra identificar onde cada campo começa quanto pra saber
-// onde ele termina (linhas seguintes até o próximo rótulo conhecido
-// pertencem ao campo atual — importante pra "Observação Análise", que
-// costuma vir em várias linhas).
-const ROTULOS_CONHECIDOS = [
-  'Situação da(s) Tarifa(s):',
-  'Situação da AET:',
-  'Observação Análise:',
-];
+require('dotenv').config();
 
-// Linhas que indicam que a captura de um campo multi-linha (ex:
-// Observação Análise) deve parar, mesmo sem ter achado o próximo
-// rótulo conhecido. O link "Voltar" é uma imagem (sem texto no
-// innerText), então não serve de sentinela — usamos os padrões de
-// rodapé realmente observados na página (ex: "13 - AET NAO PRECISA
-// DE TUV") e um limite de linhas como rede de segurança.
-const MARCADORES_DE_FIM = [/^\d+\s*-\s*/];
-const MAX_LINHAS_CAMPO_MULTILINHA = 6;
+const { chromium } = require('playwright');
+const { resolverCaptchaNaPagina } = require('./captcha_playwright.js');
+const { fazerLoginCompleto } = require('./siaet_login_completo.js');
+const { extrairSituacao, extrairPendenciaProprietario } = require('./extrair_situacao_pagina.js');
 
-function extrairCamposDoTexto(texto) {
-  const linhas = texto
-    .split('\n')
-    .map((linha) => linha.trim())
-    .filter(Boolean);
+// ---------------------------------------------------------------
+// PASSO A — Buscar uma AET específica por número/ano
+// ---------------------------------------------------------------
+// Usa o mesmo padrão de retry do login: se o OCR não chegar a 5
+// dígitos ou o site rejeitar o captcha, recarrega a página e tenta
+// de novo. Recarregar é mais simples do que tentar regenerar o
+// captcha in-place — garante formulário limpo a cada tentativa.
 
-  const valores = {};
+const TENTATIVAS_MAX_BUSCA = 100;
 
-  for (let i = 0; i < linhas.length; i++) {
-    const rotulo = ROTULOS_CONHECIDOS.find((r) => linhas[i].startsWith(r));
-    if (!rotulo) continue;
+// Confirmado pelo usuário: acessando manualmente via menu AET > Imprimir,
+// a tela mostra o botão de imprimir normalmente para uma AET liberada.
+// Só quando o script chegava direto via page.goto(URL_BUSCA) é que a
+// mesma AET caía na tela de "Observação Análise" preenchida (bloqueio),
+// sem o botão — mesmo padrão de Referer ausente já mapeado em
+// popular_aets.js/incrementar_aets.js para a listagem de AETs. Por isso
+// aqui também trocamos page.goto() por navegação real via clique de
+// menu, que é o que estabelece o Referer/estado de sessão esperado
+// pelo backend ASP.
+async function navegarParaImprimir(page) {
+  await page.getByText('AET', { exact: true }).click();
+  await page.getByText('Imprimir', { exact: true }).click();
+  await page.waitForSelector('input[name="txtNUMAet"]');
+}
 
-    let valor = linhas[i].slice(rotulo.length).trim();
+async function buscarAetPorNumero(page, numeroAet, anoAet) {
+  for (let tentativa = 1; tentativa <= TENTATIVAS_MAX_BUSCA; tentativa++) {
+    console.log(`Buscando AET ${numeroAet}/${anoAet} — tentativa ${tentativa}/${TENTATIVAS_MAX_BUSCA}...`);
 
-    // Junta linhas seguintes que não começam com outro rótulo
-    // conhecido nem batem com um marcador de fim — cobre campos
-    // multi-linha como a Observação Análise, sem vazar pro rodapé.
-    let j = i + 1;
-    let linhasAdicionadas = 0;
-    while (
-      j < linhas.length &&
-      linhasAdicionadas < MAX_LINHAS_CAMPO_MULTILINHA &&
-      !ROTULOS_CONHECIDOS.some((r) => linhas[j].startsWith(r)) &&
-      !MARCADORES_DE_FIM.some((regex) => regex.test(linhas[j]))
-    ) {
-      valor += (valor ? ' ' : '') + linhas[j];
-      j++;
-      linhasAdicionadas++;
+    await navegarParaImprimir(page);
+
+    await page.fill('input[name="txtNUMAet"]', numeroAet);
+    await page.fill('input[name="txtANOAet"]', anoAet);
+
+    let digitosCaptcha;
+    try {
+      digitosCaptcha = await resolverCaptchaNaPagina(page, 'img#captcha');
+    } catch (erroOcr) {
+      console.warn(`  OCR falhou: ${erroOcr.message}`);
+      if (tentativa === TENTATIVAS_MAX_BUSCA) throw erroOcr;
+      continue; // recarrega a página na próxima iteração
     }
 
-    valores[rotulo] = valor || null;
+    await page.fill('input[name="securityCode"]', digitosCaptcha);
+    await page.click('input[type="image"]');
+
+    // Aguarda a navegação pós-submit — o site vai para uma das duas URLs:
+    //   avisoErro.asp  → captcha errado (confirmado via HTML real da página de erro)
+    //   manEmitirBoleto ou similar → sucesso (botão cmdImprimirAET aparece)
+    // Checar a URL é mais confiável que Promise.race com múltiplas detecções
+    // de elemento (evita race condition entre timeouts concorrentes).
+    await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+    const urlAtual = page.url();
+
+    if (urlAtual.includes('avisoErro')) {
+      console.warn('  Captcha rejeitado — tentando de novo.');
+      if (tentativa === TENTATIVAS_MAX_BUSCA) {
+        throw new Error(`Busca de AET falhou após ${TENTATIVAS_MAX_BUSCA} tentativas (captcha rejeitado repetidamente).`);
+      }
+      continue; // navegarParaImprimir(page) no topo do próximo loop recarrega tudo, via clique real de menu
+    }
+
+    // Confirma que o botão de imprimir está presente na página resultante.
+    // Timeout de 15s: dá margem suficiente pro elemento renderizar em
+    // conexões mais lentas antes de considerar que ele realmente não existe.
+    const btnImprimir = page.locator('input[name="cmdImprimirAET"]');
+    if (await btnImprimir.isVisible({ timeout: 15000 }).catch(() => false)) {
+      console.log(`  AET encontrada na tentativa ${tentativa}.`);
+      return;
+    }
+
+    // Botão não apareceu — antes de assumir erro genérico, tenta extrair
+    // o painel de "Situação da AET" da própria página (sem captcha extra).
+    // IMPORTANTE: "Situação da AET" e "Situação da(s) Tarifa(s)" são
+    // texto fixo do template desta tela (confirmado: mesmo texto com
+    // e sem o botão de imprimir presente) — não servem pra decidir se
+    // há pendência real. Só a "Observação Análise" é confiável: vazia
+    // quando não há bloqueio, preenchida quando há.
+    const situacao = await extrairSituacao(page);
+    if (situacao.observacaoAnalise) {
+      // Observação Análise preenchida = SIAET está de fato reportando
+      // um bloqueio real (tarifa, devolução, etc) — pendência de
+      // negócio legítima.
+      const erroSituacao = new Error(situacao.situacaoAet || situacao.observacaoAnalise);
+      erroSituacao.situacao = situacao;
+      throw erroSituacao;
+    }
+    // Sem Observação Análise: o SIAET não reportou nenhum bloqueio real,
+    // então o botão não ter sido encontrado é uma falha TÉCNICA (ex:
+    // timing, seletor, mudança de layout) — não anexamos erro.situacao
+    // aqui, pra não virar pendência falsa em aet_situacoes. Isso cai no
+    // erro genérico lá embaixo, que já gera screenshot em anexar_aets.js
+    // (útil pra diagnosticar o que a página realmente mostrava).
+
+    // Não é devolução — tenta o outro caso conhecido: pendência de
+    // dados do proprietário da carga (manProprietarioCarga.asp).
+    const pendenciaProprietario = await extrairPendenciaProprietario(page);
+    if (pendenciaProprietario) {
+      const erroPendencia = new Error(pendenciaProprietario.situacaoAet);
+      erroPendencia.situacao = pendenciaProprietario;
+      throw erroPendencia;
+    }
+
+    // Nem captcha errado, nem sucesso, nem painel de situação reconhecido
+    // — situação realmente não mapeada ainda.
+    throw new Error(`URL inesperada após submit na tentativa ${tentativa}: ${urlAtual}`);
   }
-
-  return {
-    tipoPendencia: valores['Situação da AET:'] ? 'devolvida_correcao' : null,
-    situacaoTarifa: valores['Situação da(s) Tarifa(s):'] || null,
-    situacaoAet: valores['Situação da AET:'] || null,
-    observacaoAnalise: valores['Observação Análise:'] || null,
-  };
-}
-
-// Retorna os três campos como null se a página atual não tiver esse
-// painel — permite chamar "no escuro" (ex: tentar extrair sempre que
-// o botão de imprimir não aparecer) sem precisar checar antes se a
-// tela é a certa.
-async function extrairSituacao(page) {
-  const textoPagina = await page.locator('body').innerText().catch(() => '');
-  return extrairCamposDoTexto(textoPagina);
-}
-
-// Atalho pra decidir rapidamente se vale a pena tentar persistir o
-// resultado (evita gravar linha vazia em aet_situacoes quando a
-// página não tinha nenhum desses campos — ex: manProprietarioCarga).
-function situacaoTemDados(situacao) {
-  return Boolean(situacao.situacaoTarifa || situacao.situacaoAet || situacao.observacaoAnalise);
 }
 
 // ---------------------------------------------------------------
-// Pendência de proprietário da carga (manProprietarioCarga.asp)
+// PASSO B — Gerar PDF a partir da tela de impressão da AET
 // ---------------------------------------------------------------
-// Tela diferente da "Situação da AET" — pede nota fiscal/DAMDFE/DTA
-// ou DI/DUIMP antes de liberar a impressão. Os campos do formulário
-// (nome/razão social, número da nota, chave de acesso) são inputs,
-// não texto renderizado — não dá pra ler via innerText como os
-// outros campos. Por enquanto só detectamos e registramos QUE existe
-// essa pendência (suficiente pra alimentar uma futura tela no front
-// pedindo os dados ao usuário); se um dia for preciso automatizar o
-// preenchimento desse formulário, aí sim vale mapear os seletores
-// exatos dos inputs a partir do HTML real da página.
-const TEXTO_PENDENCIA_PROPRIETARIO = 'deverá informar os dados da Nota Fiscal';
+// Confirmado via vídeo: cmdImprimirAET abre um popup com uma página
+// HTML da AET (aet_cie_f02_v5.asp) — NÃO é um download de arquivo.
+// O Playwright resolve isso com page.pdf(), que gera um PDF a partir
+// do conteúdo da página em modo headless, sem precisar de diálogo
+// de impressão nem evento de download.
 
-async function extrairPendenciaProprietario(page) {
-  const textoPagina = await page.locator('body').innerText().catch(() => '');
-  const temPendencia = textoPagina.includes(TEXTO_PENDENCIA_PROPRIETARIO);
+async function baixarPdfAet(page, caminhoSalvar) {
+  const popupPromise = page.waitForEvent('popup');
+  await page.click('input[name="cmdImprimirAET"]');
+  const popup = await popupPromise;
 
-  if (!temPendencia) return null;
+  // Aguarda o conteúdo da AET carregar completamente antes de gerar o PDF
+  await popup.waitForLoadState('networkidle');
 
-  return {
-    tipoPendencia: 'proprietario_carga',
-    situacaoTarifa: null,
-    situacaoAet: 'Faltam informações do proprietário da carga (Nota Fiscal, DAMDFE, DTA/DI ou DUIMP) — precisa ser preenchido no SIAET antes de imprimir.',
-    observacaoAnalise: null,
-  };
+  await popup.pdf({
+    path: caminhoSalvar,
+    format: 'A4',
+    printBackground: true,  // preserva as cores e bordas da tabela
+  });
+
+  await popup.close().catch(() => {});
+  console.log(`PDF salvo em: ${caminhoSalvar}`);
 }
 
-module.exports = { extrairSituacao, situacaoTemDados, extrairPendenciaProprietario };
+// ---------------------------------------------------------------
+// Atalho: busca + baixa em uma chamada só
+// ---------------------------------------------------------------
+
+async function imprimirAet(page, numeroAet, anoAet, caminhoSalvar) {
+  await buscarAetPorNumero(page, numeroAet, anoAet);
+  await baixarPdfAet(page, caminhoSalvar);
+}
+
+module.exports = { buscarAetPorNumero, baixarPdfAet, imprimirAet };
+
+// ---------------------------------------------------------------
+// EXECUÇÃO — só roda quando este arquivo é chamado diretamente
+// ---------------------------------------------------------------
+
+if (require.main === module) {
+  // Número/ano de teste (AET real vista no print/vídeo enviados).
+  // Para uso real, troque pelos valores desejados — ou adapte para
+  // ler de argumentos de linha de comando (process.argv).
+  const NUMERO_AET_TESTE = '229767';
+  const ANO_AET_TESTE = '2026';
+  const CAMINHO_PDF_TESTE = `.AETS/aet-${NUMERO_AET_TESTE}-${ANO_AET_TESTE}.pdf`;
+
+  (async () => {
+    const browser = await chromium.launch({ headless: false, slowMo: 800 });
+    const context = await browser.newContext({ acceptDownloads: true });
+    const page = await context.newPage();
+
+    try {
+      await fazerLoginCompleto(page);
+      console.log('Login concluído — buscando AET...');
+
+      await imprimirAet(page, NUMERO_AET_TESTE, ANO_AET_TESTE, CAMINHO_PDF_TESTE);
+    } catch (erro) {
+      console.error('Falha ao imprimir AET:', erro.message);
+      if (erro.situacao) {
+        console.error('Situação extraída:', erro.situacao);
+      }
+      await page.screenshot({ path: 'erro-imprimir-aet.png' });
+    } finally {
+      await browser.close();
+    }
+  })();
+}

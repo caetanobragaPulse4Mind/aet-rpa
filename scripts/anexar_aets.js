@@ -1,14 +1,28 @@
 /**
  * anexar_aets.js
  *
- * Script standalone (execução manual via docker exec) que:
+ * Roda de dois jeitos:
+ *
+ *   A) Standalone (docker exec ... node scripts/anexar_aets.js):
+ *      abre o próprio browser headless, faz login no SIAET e processa
+ *      todas as AETs com pdf_anexado = false/null. Comportamento igual
+ *      ao de sempre — o bloco `if (require.main === module)` no fim
+ *      cuida disso.
+ *
+ *   B) Importado por outro script (ex: incrementar_aets.js):
+ *      exporta `anexarPendentes(page)`, que recebe uma page JÁ logada
+ *      no SIAET e só faz o trabalho — não abre browser nem loga de
+ *      novo. Assim o incrementar reaproveita a sessão que já tem em
+ *      mãos depois de sincronizar as AETs novas.
+ *
+ * O que ele faz em ambos os casos:
  *   1. Autentica no Supabase (signInWithPassword — mesmo padrão de popular_aets.js)
  *   2. Busca em `aets` os registros com pdf_anexado = false/null
- *   3. Faz login no SIAET (fazerLoginCompleto)
- *   4. Para cada AET pendente: gera o PDF (imprimirAet), comprime com
+ *      (ou usa a lista de registros passada pelo chamador)
+ *   3. Para cada AET pendente: gera o PDF (imprimirAet), comprime com
  *      Ghostscript (/ebook) e salva em /app/pdfs/aets/{numero}-{ano}.pdf
- *   5. Marca pdf_anexado = true no Supabase
- *   6. Erro numa AET não interrompe o lote — loga e segue pra próxima
+ *   4. Marca pdf_anexado = true no Supabase
+ *   5. Erro numa AET não interrompe o lote — loga e segue pra próxima
  *
  * Pré-requisitos:
  *   - Coluna `pdf_anexado` (boolean) na tabela `aets`:
@@ -18,7 +32,7 @@
  *   - imprimir_aet.js, siaet_login_completo.js, captcha_playwright.js
  *     na mesma pasta scripts/
  *
- * Execução (dentro do container em produção):
+ * Execução standalone (dentro do container em produção):
  *   docker exec -it $(docker ps -qf "name=aet-rpa_aet-rpa") node scripts/anexar_aets.js
  */
 
@@ -62,6 +76,30 @@ function logErro(...args) {
   const linha = `[${new Date().toISOString()}] ${args.join(' ')}`;
   console.error(linha);
   if (streamLog) streamLog.write(linha + '\n');
+}
+
+// Cria as pastas e abre o stream de log. Idempotente: pode ser
+// chamada tanto pelo bloco standalone quanto pelo anexarPendentes
+// sem risco de reabrir o stream (guarda em `if (!streamLog)`).
+function inicializarLog() {
+  fs.mkdirSync(PASTA_PDFS, { recursive: true });
+  fs.mkdirSync(PASTA_LOGS, { recursive: true });
+  fs.mkdirSync(PASTA_SCREENSHOTS, { recursive: true });
+  if (!streamLog) {
+    streamLog = fs.createWriteStream(
+      path.join(PASTA_LOGS, `execucao-${timestampExecucao}.log`),
+      { flags: 'a' }
+    );
+  }
+}
+
+// Fecha o stream de log. O chamador (standalone ou incrementar_aets)
+// chama isso no finally pra garantir o flush do arquivo.
+function finalizarLog() {
+  if (streamLog) {
+    streamLog.end();
+    streamLog = null;
+  }
 }
 
 // Falhas registradas separadamente em JSON, pra consultar depois
@@ -131,7 +169,9 @@ async function capturarScreenshotFalha(page, numeroAet) {
 }
 // GS_PRESET: /screen (mais agressivo) | /ebook (equilíbrio) | /printer (qualidade)
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// Variável unificada com o incrementar_aets.js — os dois scripts agora
+// leem SUPABASE_PUBLISHABLE_KEY (antes este aqui usava SUPABASE_KEY).
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_PUBLISHABLE_KEY);
 
 // ---------------------------------------------------------------
 // Supabase
@@ -152,6 +192,23 @@ async function buscarAetsPendentes() {
     .or('pdf_anexado.is.null,pdf_anexado.eq.false');
 
   if (error) throw new Error(`Falha ao consultar AETs pendentes: ${error.message}`);
+  return data;
+}
+
+// Busca uma AET específica por numero_aet exato (ex: "288445/2026") —
+// usado no modo standalone quando se quer reprocessar SÓ uma AET (ex:
+// depois de corrigir manualmente uma pendência no SIAET), sem esperar
+// ela reaparecer no próximo incrementar_aets.js nem rodar o lote
+// completo de todas as pendentes.
+async function buscarAetPorNumeroExato(numeroAet) {
+  const { data, error } = await supabase
+    .from('aets')
+    .select('id, numero_aet')
+    .eq('numero_aet', numeroAet)
+    .maybeSingle();
+
+  if (error) throw new Error(`Falha ao buscar AET ${numeroAet}: ${error.message}`);
+  if (!data) throw new Error(`AET ${numeroAet} não encontrada na tabela aets.`);
   return data;
 }
 
@@ -282,24 +339,35 @@ async function processarAet(page, registro) {
 }
 
 // ---------------------------------------------------------------
-// Execução principal
+// Núcleo reutilizável
+//
+// Recebe uma `page` JÁ logada no SIAET. NÃO abre browser nem faz
+// login — quem chama cuida disso (o bloco standalone lá embaixo, ou
+// o incrementar_aets.js que reaproveita a própria sessão).
+//
+// Opções:
+//   registros: lista [{ id, numero_aet }] pra processar. Se null
+//              (padrão), busca todas as AETs pendentes no Supabase.
+//              O incrementar pode passar só as AETs novas da rodada.
+//
+// Retorna { sucesso, pendencia, falha } pro chamador logar/decidir.
 // ---------------------------------------------------------------
 
-(async () => {
-  fs.mkdirSync(PASTA_PDFS, { recursive: true });
-  fs.mkdirSync(PASTA_LOGS, { recursive: true });
-  fs.mkdirSync(PASTA_SCREENSHOTS, { recursive: true });
-  streamLog = fs.createWriteStream(
-    path.join(PASTA_LOGS, `execucao-${timestampExecucao}.log`),
-    { flags: 'a' }
-  );
+async function anexarPendentes(page, { registros = null } = {}) {
+  await inicializarLog();
 
   log('Autenticando no Supabase...');
   await autenticarSupabase();
 
-  log('Buscando AETs pendentes de anexação...');
-  let pendentes = await buscarAetsPendentes();
-  log(`${pendentes.length} AET(s) pendente(s) (limitado a 1000 por página da API — pode haver mais).`);
+  let pendentes;
+  if (registros) {
+    pendentes = registros;
+    log(`${pendentes.length} AET(s) recebida(s) do chamador para anexação.`);
+  } else {
+    log('Buscando AETs pendentes de anexação...');
+    pendentes = await buscarAetsPendentes();
+    log(`${pendentes.length} AET(s) pendente(s) (limitado a 1000 por página da API — pode haver mais).`);
+  }
 
   // LIMITE_TESTE=N roda só os N primeiros pendentes — útil pra validar
   // visualmente o resultado (PDF gerado + compressão) antes de soltar
@@ -312,74 +380,110 @@ async function processarAet(page, registro) {
 
   if (pendentes.length === 0) {
     log('Nada a fazer.');
-    streamLog.end();
-    return;
+    return { sucesso: 0, pendencia: 0, falha: 0 };
   }
-
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
-  const page = await context.newPage();
 
   let sucesso = 0;
   let pendencia = 0;
   let falha = 0;
 
-  try {
-    log('Fazendo login no SIAET...');
-    await fazerLoginCompleto(page);
-    log('Login concluído.');
+  const total = pendentes.length;
+  const inicioLote = Date.now();
 
-    const total = pendentes.length;
-    const inicioLote = Date.now();
+  for (let i = 0; i < total; i++) {
+    const registro = pendentes[i];
+    const numeroProcessado = i + 1;
 
-    for (let i = 0; i < total; i++) {
-      const registro = pendentes[i];
-      const numeroProcessado = i + 1;
-
-      try {
-        await processarAet(page, registro);
-        sucesso++;
-      } catch (erro) {
-        if (erro.situacao) {
-          // Pendência de negócio conhecida (AET cancelada, devolvida,
-          // proprietário da carga pendente, em digitação, etc) — não
-          // é uma falha do script, e sim um estado real do SIAET que
-          // já foi extraído e registrado em aet_situacoes. Não conta
-          // como falha, e não precisa de screenshot (já temos o dado
-          // estruturado, tirar print só custaria tempo à toa).
-          pendencia++;
-          log(`[${registro.numero_aet}] PENDÊNCIA: ${classificarErro(erro)}`);
-          await registrarSituacaoAet(registro, erro.situacao);
-        } else {
-          // Falha técnica real (timeout de rede, captcha esgotado,
-          // tela não mapeada) — essas sim precisam de investigação.
-          falha++;
-          logErro(`[${registro.numero_aet}] ERRO: ${classificarErro(erro)}`);
-          const caminhoScreenshot = await capturarScreenshotFalha(page, registro.numero_aet);
-          registrarFalha(registro.numero_aet, erro, caminhoScreenshot);
-        }
+    try {
+      await processarAet(page, registro);
+      sucesso++;
+    } catch (erro) {
+      if (erro.situacao) {
+        // Pendência de negócio conhecida (AET cancelada, devolvida,
+        // proprietário da carga pendente, em digitação, etc) — não
+        // é uma falha do script, e sim um estado real do SIAET que
+        // já foi extraído e registrado em aet_situacoes. Não conta
+        // como falha, e não precisa de screenshot (já temos o dado
+        // estruturado, tirar print só custaria tempo à toa).
+        pendencia++;
+        log(`[${registro.numero_aet}] PENDÊNCIA: ${classificarErro(erro)}`);
+        await registrarSituacaoAet(registro, erro.situacao);
+      } else {
+        // Falha técnica real (timeout de rede, captcha esgotado,
+        // tela não mapeada) — essas sim precisam de investigação.
+        falha++;
+        logErro(`[${registro.numero_aet}] ERRO: ${classificarErro(erro)}`);
+        const caminhoScreenshot = await capturarScreenshotFalha(page, registro.numero_aet);
+        registrarFalha(registro.numero_aet, erro, caminhoScreenshot);
       }
-
-      // Progresso + estimativa de tempo restante, baseado no tempo
-      // médio por AET até agora (varia bastante por causa do OCR do
-      // captcha, então é uma média corrida, não um valor fixo)
-      const decorridoMs = Date.now() - inicioLote;
-      const mediaPorAetMs = decorridoMs / numeroProcessado;
-      const restantes = total - numeroProcessado;
-      const etaMs = restantes * mediaPorAetMs;
-
-      log(
-        `Progresso: ${numeroProcessado}/${total} ` +
-        `(${sucesso} ok, ${pendencia} pendência, ${falha} falha) — ` +
-        `decorrido: ${formatarDuracao(decorridoMs)} — ` +
-        `ETA: ${formatarDuracao(etaMs)}`
-      );
     }
-  } finally {
-    await browser.close();
+
+    // Progresso + estimativa de tempo restante, baseado no tempo
+    // médio por AET até agora (varia bastante por causa do OCR do
+    // captcha, então é uma média corrida, não um valor fixo)
+    const decorridoMs = Date.now() - inicioLote;
+    const mediaPorAetMs = decorridoMs / numeroProcessado;
+    const restantes = total - numeroProcessado;
+    const etaMs = restantes * mediaPorAetMs;
+
+    log(
+      `Progresso: ${numeroProcessado}/${total} ` +
+      `(${sucesso} ok, ${pendencia} pendência, ${falha} falha) — ` +
+      `decorrido: ${formatarDuracao(decorridoMs)} — ` +
+      `ETA: ${formatarDuracao(etaMs)}`
+    );
   }
 
   log(`Finalizado. Sucesso: ${sucesso} | Pendências conhecidas: ${pendencia} | Falhas reais: ${falha}`);
   salvarFalhasEmArquivo();
-  streamLog.end();
-})();
+
+  return { sucesso, pendencia, falha };
+}
+
+// ---------------------------------------------------------------
+// Execução standalone (docker exec ... node scripts/anexar_aets.js).
+//
+// Quando o arquivo é apenas importado (ex: incrementar_aets.js chama
+// anexarPendentes reaproveitando a sessão já logada), este bloco NÃO
+// roda — require.main !== module.
+// ---------------------------------------------------------------
+
+if (require.main === module) {
+  (async () => {
+    await inicializarLog();
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    try {
+      log('Autenticando no Supabase...');
+      await autenticarSupabase();
+
+      // NUMERO_AET='288445/2026' node scripts/anexar_aets.js — roda a
+      // anexação só pra essa AET específica (ex: depois de corrigir uma
+      // pendência manualmente no SIAET), em vez de varrer todas as
+      // pendentes do banco.
+      let opcoes = {};
+      const numeroAlvo = process.env.NUMERO_AET;
+      if (numeroAlvo) {
+        const registro = await buscarAetPorNumeroExato(numeroAlvo);
+        opcoes = { registros: [registro] };
+        log(`NUMERO_AET ativo — processando só a AET ${numeroAlvo} (id=${registro.id}).`);
+      }
+
+      log('Fazendo login no SIAET...');
+      await fazerLoginCompleto(page);
+      log('Login concluído.');
+
+      await anexarPendentes(page, opcoes);
+    } catch (erro) {
+      logErro(`Erro fatal na execução standalone: ${erro.message}`);
+    } finally {
+      await browser.close();
+      finalizarLog();
+    }
+  })();
+}
+
+module.exports = { anexarPendentes, finalizarLog };

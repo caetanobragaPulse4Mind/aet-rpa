@@ -41,7 +41,7 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const { resolverCaptchaNaPagina } = require('./captcha_playwright.js');
 const { fazerLoginCompleto } = require('./siaet_login_completo.js');
-const { extrairSituacao, situacaoTemDados, extrairPendenciaProprietario } = require('./extrair_situacao_pagina.js');
+const { extrairSituacao, extrairPendenciaProprietario } = require('./extrair_situacao_pagina.js');
 
 // ---------------------------------------------------------------
 // PASSO A — Buscar uma AET específica por número/ano
@@ -52,14 +52,27 @@ const { extrairSituacao, situacaoTemDados, extrairPendenciaProprietario } = requ
 // captcha in-place — garante formulário limpo a cada tentativa.
 
 const TENTATIVAS_MAX_BUSCA = 100;
-const URL_BUSCA = 'https://siaet.dnit.gov.br/manutencao/manAet.asp?op=emt';
+
+// Confirmado pelo usuário: acessando manualmente via menu AET > Imprimir,
+// a tela mostra o botão de imprimir normalmente para uma AET liberada.
+// Só quando o script chegava direto via page.goto(URL_BUSCA) é que a
+// mesma AET caía na tela de "Observação Análise" preenchida (bloqueio),
+// sem o botão — mesmo padrão de Referer ausente já mapeado em
+// popular_aets.js/incrementar_aets.js para a listagem de AETs. Por isso
+// aqui também trocamos page.goto() por navegação real via clique de
+// menu, que é o que estabelece o Referer/estado de sessão esperado
+// pelo backend ASP.
+async function navegarParaImprimir(page) {
+  await page.getByText('AET', { exact: true }).click();
+  await page.getByText('Imprimir', { exact: true }).click();
+  await page.waitForSelector('input[name="txtNUMAet"]');
+}
 
 async function buscarAetPorNumero(page, numeroAet, anoAet) {
   for (let tentativa = 1; tentativa <= TENTATIVAS_MAX_BUSCA; tentativa++) {
     console.log(`Buscando AET ${numeroAet}/${anoAet} — tentativa ${tentativa}/${TENTATIVAS_MAX_BUSCA}...`);
 
-    await page.goto(URL_BUSCA);
-    await page.waitForSelector('input[name="txtNUMAet"]');
+    await navegarParaImprimir(page);
 
     await page.fill('input[name="txtNUMAet"]', numeroAet);
     await page.fill('input[name="txtANOAet"]', anoAet);
@@ -89,7 +102,7 @@ async function buscarAetPorNumero(page, numeroAet, anoAet) {
       if (tentativa === TENTATIVAS_MAX_BUSCA) {
         throw new Error(`Busca de AET falhou após ${TENTATIVAS_MAX_BUSCA} tentativas (captcha rejeitado repetidamente).`);
       }
-      continue; // goto(URL_BUSCA) no topo do próximo loop recarrega tudo
+      continue; // navegarParaImprimir(page) no topo do próximo loop recarrega tudo, via clique real de menu
     }
 
     // Confirma que o botão de imprimir está presente na página resultante.
@@ -103,14 +116,26 @@ async function buscarAetPorNumero(page, numeroAet, anoAet) {
 
     // Botão não apareceu — antes de assumir erro genérico, tenta extrair
     // o painel de "Situação da AET" da própria página (sem captcha extra).
-    // Cobre casos como AET devolvida para correção, que usa a mesma URL
-    // de sucesso (manEmitirBoleto.asp) mas sem o botão de imprimir.
+    // IMPORTANTE: "Situação da AET" e "Situação da(s) Tarifa(s)" são
+    // texto fixo do template desta tela (confirmado: mesmo texto com
+    // e sem o botão de imprimir presente) — não servem pra decidir se
+    // há pendência real. Só a "Observação Análise" é confiável: vazia
+    // quando não há bloqueio, preenchida quando há.
     const situacao = await extrairSituacao(page);
-    if (situacaoTemDados(situacao)) {
-      const erroSituacao = new Error(situacao.situacaoAet || 'AET com situação pendente no SIAET.');
+    if (situacao.observacaoAnalise) {
+      // Observação Análise preenchida = SIAET está de fato reportando
+      // um bloqueio real (tarifa, devolução, etc) — pendência de
+      // negócio legítima.
+      const erroSituacao = new Error(situacao.situacaoAet || situacao.observacaoAnalise);
       erroSituacao.situacao = situacao;
       throw erroSituacao;
     }
+    // Sem Observação Análise: o SIAET não reportou nenhum bloqueio real,
+    // então o botão não ter sido encontrado é uma falha TÉCNICA (ex:
+    // timing, seletor, mudança de layout) — não anexamos erro.situacao
+    // aqui, pra não virar pendência falsa em aet_situacoes. Isso cai no
+    // erro genérico lá embaixo, que já gera screenshot em anexar_aets.js
+    // (útil pra diagnosticar o que a página realmente mostrava).
 
     // Não é devolução — tenta o outro caso conhecido: pendência de
     // dados do proprietário da carga (manProprietarioCarga.asp).
