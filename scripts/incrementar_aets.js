@@ -53,6 +53,113 @@ const { fazerLoginCompleto } = require('./siaet_login_completo.js');
 // Termius depois.
 const PASTA_LOGS = process.env.PASTA_LOGS_AETS || './logs/execucao-incremento-aets';
 const PASTA_SCREENSHOTS = process.env.PASTA_SCREENSHOTS_AETS || './logs/screenshots-incremento-aets';
+
+// Arquivo único acumulando todas as rodadas (append). No Hetzner,
+// PASTA_LOGS aponta pro volume persistente (/app/pdfs/...) via env no
+// compose, então este arquivo sobrevive a restart/redeploy e pode ser
+// consultado depois via Termius.
+const ARQUIVO_LOG = path.join(PASTA_LOGS, 'incremento-aets.log');
+
+// Pasta onde cada rodada grava um arquivo NOVO (com timestamp no nome)
+// listando os numero_aet inseridos nessa rodada — um por linha. É esse
+// arquivo que o script de anexação de PDF vai consumir pra saber
+// exatamente quais AETs processar, em vez de varrer o banco todo.
+// No Hetzner, aponta pro volume persistente via env no compose.
+const PASTA_AETS_NOVAS =
+  process.env.PASTA_AETS_NOVAS || './logs/aets-novas';
+
+// ---------------------------------------------------------------
+// Logger — espelha tudo que vai pro console também no arquivo de log
+// acumulado. Escreve com fs.appendFileSync (síncrono) pra garantir
+// que cada linha seja gravada na hora, mesmo se o processo morrer no
+// meio. streamLog fica aberto durante a execução; iniciarLog escreve
+// um cabeçalho com timestamp pra separar visualmente as rodadas
+// dentro do arquivo acumulado.
+// ---------------------------------------------------------------
+
+function log(mensagem) {
+  console.log(mensagem);
+  try {
+    fs.appendFileSync(ARQUIVO_LOG, mensagem + '\n');
+  } catch (e) {
+    // Se falhar a gravação em disco, não derruba a execução — o
+    // console.log acima já garante visibilidade mínima.
+    console.error(`(aviso: não foi possível gravar no log em disco: ${e.message})`);
+  }
+}
+
+function logErro(mensagem) {
+  console.error(mensagem);
+  try {
+    fs.appendFileSync(ARQUIVO_LOG, mensagem + '\n');
+  } catch (e) {
+    console.error(`(aviso: não foi possível gravar no log em disco: ${e.message})`);
+  }
+}
+
+function iniciarLog() {
+  const cabecalho =
+    `\n===== Execução iniciada em ${new Date().toISOString()} =====`;
+  log(cabecalho);
+}
+
+// ---------------------------------------------------------------
+// Valida, logo no início (fail-fast), se dá pra escrever de fato no
+// volume de log — ANTES de abrir o navegador e mexer no Supabase.
+// Assim, se o volume não estiver montado/acessível (ex: PASTA_LOGS
+// apontando pra fora do volume persistente, ou sem permissão), o
+// script falha na largada com mensagem clara, em vez de fazer todo o
+// trabalho pesado e só depois descobrir que o log não persistiu.
+//
+// Faz um teste real de escrita (cria a pasta, grava e apaga um
+// arquivo temporário) porque só checar existência da pasta não
+// garante permissão de escrita.
+// ---------------------------------------------------------------
+
+function validarEscritaLog() {
+  try {
+    fs.mkdirSync(PASTA_LOGS, { recursive: true });
+    const arquivoTeste = path.join(PASTA_LOGS, `.write-test-${process.pid}`);
+    fs.writeFileSync(arquivoTeste, 'ok');
+    fs.unlinkSync(arquivoTeste);
+  } catch (e) {
+    throw new Error(
+      `Não foi possível gravar no diretório de log "${PASTA_LOGS}" ` +
+      `(${e.message}). Confira se PASTA_LOGS_AETS aponta pra dentro do ` +
+      `volume persistente montado no container e se há permissão de ` +
+      `escrita. O script foi abortado antes de buscar/salvar qualquer AET.`
+    );
+  }
+}
+
+// ---------------------------------------------------------------
+// Grava um arquivo NOVO por rodada (timestamp no nome) listando os
+// numero_aet inseridos nessa rodada — um por linha, texto puro. É o
+// "recado" que o script de anexação de PDF consome pra saber quais
+// AETs processar, sem varrer o banco inteiro.
+//
+// Sempre gera o arquivo, mesmo sem AETs novas (fica vazio) — assim o
+// consumidor sempre encontra um arquivo correspondente à execução e
+// não fica em dúvida se a rodada aconteceu ou não.
+//
+// Retorna o caminho do arquivo gerado (pra logar).
+// ---------------------------------------------------------------
+
+function gravarArquivoAetsNovas(numeros) {
+  fs.mkdirSync(PASTA_AETS_NOVAS, { recursive: true });
+
+  // Nome com timestamp ISO (sanitizado pra ser válido em filesystem):
+  // aets-novas-2026-07-21T21-54-56-106Z.txt
+  const carimbo = new Date().toISOString().replace(/[:.]/g, '-');
+  const caminho = path.join(PASTA_AETS_NOVAS, `aets-novas-${carimbo}.txt`);
+
+  // Um numero_aet por linha. Se não houve nenhuma, grava arquivo vazio.
+  const conteudo = numeros.length > 0 ? numeros.join('\n') + '\n' : '';
+  fs.writeFileSync(caminho, conteudo);
+
+  return caminho;
+}
+
 // ---------------------------------------------------------------
 // Cliente Supabase — mesma lógica de auth de popular_aets.js: sem
 // service role key (Lovable Cloud), então autentica via
@@ -79,7 +186,7 @@ async function autenticarSupabase() {
     );
   }
 
-  console.log(`Autenticado no Supabase como ${data.user.email}.`);
+  log(`Autenticado no Supabase como ${data.user.email}.`);
 }
 
 // ---------------------------------------------------------------
@@ -173,7 +280,7 @@ async function extrairLinhasDaTabela(page) {
 // ---------------------------------------------------------------
 
 async function buscarMesAtual(page, ano, mes) {
-  console.log(`Buscando AETs de ${String(mes).padStart(2, '0')}/${ano}...`);
+  log(`Buscando AETs de ${String(mes).padStart(2, '0')}/${ano}...`);
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'load' }),
@@ -215,7 +322,7 @@ async function buscarMesAtual(page, ano, mes) {
   }
 
   const linhasBrutas = await extrairLinhasDaTabela(page);
-  console.log(`  ${linhasBrutas.length} AET(s) encontrada(s) no mês.`);
+  log(`  ${linhasBrutas.length} AET(s) encontrada(s) no mês.`);
 
   return linhasBrutas.map((l) => ({
     numero_aet: l.numero_aet,
@@ -256,7 +363,7 @@ function comTimeout(promessa, ms, mensagemErro) {
 async function salvarNoSupabase(registros) {
   if (registros.length === 0) return [];
 
-  console.log(`  Salvando ${registros.length} registro(s) novo(s) no Supabase...`);
+  log(`  Salvando ${registros.length} registro(s) novo(s) no Supabase...`);
 
   // .select('id, numero_aet') no upsert devolve as linhas gravadas.
   const { data, error } = await comTimeout(
@@ -271,11 +378,11 @@ async function salvarNoSupabase(registros) {
   );
 
   if (error) {
-    console.error('  Erro ao salvar no Supabase:', error.message);
+    logErro(`  Erro ao salvar no Supabase: ${error.message}`);
     throw error;
   }
 
-  console.log('  Salvo.');
+  log('  Salvo.');
   return data || [];
 }
 
@@ -284,8 +391,22 @@ async function salvarNoSupabase(registros) {
 // ---------------------------------------------------------------
 
 (async () => {
-  fs.mkdirSync(PASTA_LOGS, { recursive: true });
+  // Fail-fast: valida escrita no volume de log ANTES de qualquer
+  // trabalho pesado. Se não der pra gravar (volume não montado, sem
+  // permissão, caminho fora do volume), aborta aqui com mensagem clara
+  // e código de saída 1 — sem abrir navegador nem tocar no Supabase.
+  try {
+    validarEscritaLog();
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+
   fs.mkdirSync(PASTA_SCREENSHOTS, { recursive: true });
+
+  // Cabeçalho com timestamp pra separar esta rodada das anteriores
+  // dentro do arquivo de log acumulado.
+  iniciarLog();
 
   // headless: true — obrigatório na Hetzner, que não tem display.
   const browser = await chromium.launch({ headless: true });
@@ -301,48 +422,56 @@ async function salvarNoSupabase(registros) {
     const mesAtual = hoje.getMonth() + 1;
 
     const ultimoNumero = await buscarUltimoNumeroDoAno(anoAtual);
-    console.log(
+    log(
       ultimoNumero > 0
         ? `Última AET salva no ano ${anoAtual}: ${ultimoNumero}. Buscando números maiores que esse.`
         : `Nenhuma AET salva ainda no ano ${anoAtual}. Todas as encontradas no mês serão salvas.`
     );
 
     await fazerLoginCompleto(page);
-    console.log('Login concluído.');
+    log('Login concluído.');
 
     await navegarParaListagem(page);
-    console.log(`Entrou na listagem de AETs — buscando somente ${String(mesAtual).padStart(2, '0')}/${anoAtual}.\n`);
+    log(`Entrou na listagem de AETs — buscando somente ${String(mesAtual).padStart(2, '0')}/${anoAtual}.\n`);
 
     const registrosDoMes = await buscarMesAtual(page, anoAtual, mesAtual);
     const registrosNovos = filtrarNovos(registrosDoMes, anoAtual, ultimoNumero);
 
-    console.log(
+    log(
       `  ${registrosNovos.length} de ${registrosDoMes.length} são novos (numero_aet > ${ultimoNumero}).`
     );
 
     const registrosSalvos = await salvarNoSupabase(registrosNovos);
 
-    console.log(`\nConcluído. ${registrosNovos.length} AET(s) nova(s) inserida(s)/atualizada(s).`);
+    log(`\nConcluído. ${registrosNovos.length} AET(s) nova(s) inserida(s)/atualizada(s).`);
 
-    // Log na tela (por enquanto só console.log — sem persistência em
-    // arquivo/tabela ainda) com os números das AETs salvas nesta
-    // rodada, pra dar visibilidade rápida do que entrou sem precisar
-    // ir no Supabase conferir.
-    if (registrosSalvos.length > 0) {
-      const numerosSalvos = registrosSalvos.map((r) => r.numero_aet);
-      console.log(`Números das AETs salvas: ${numerosSalvos.join(', ')}`);
+    // Números das AETs salvas nesta rodada — vai pra tela e pro
+    // arquivo de log acumulado, pra dar visibilidade rápida do que
+    // entrou sem precisar ir no Supabase conferir.
+    const numerosSalvos = registrosSalvos.map((r) => r.numero_aet);
+    if (numerosSalvos.length > 0) {
+      log(`Números das AETs salvas: ${numerosSalvos.join(', ')}`);
     }
+
+    // Arquivo da rodada (um numero_aet por linha) pro script de
+    // anexação consumir. Sempre gerado, mesmo vazio.
+    const caminhoAetsNovas = gravarArquivoAetsNovas(numerosSalvos);
+    log(
+      numerosSalvos.length > 0
+        ? `Arquivo com ${numerosSalvos.length} AET(s) nova(s) gravado em: ${caminhoAetsNovas}`
+        : `Nenhuma AET nova nesta rodada — arquivo vazio gravado em: ${caminhoAetsNovas}`
+    );
   } catch (erro) {
-    console.error('Falha no script:', erro.message);
+    logErro(`Falha no script: ${erro.message}`);
     // Salvo no volume persistente (não na raiz do container) — sem
     // isso o print some no próximo redeploy/restart.
     const nomeArquivo = `erro-incrementar-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
     const caminhoScreenshot = path.join(PASTA_SCREENSHOTS, nomeArquivo);
     try {
       await page.screenshot({ path: caminhoScreenshot });
-      console.error(`Screenshot da falha salvo em: ${caminhoScreenshot}`);
+      logErro(`Screenshot da falha salvo em: ${caminhoScreenshot}`);
     } catch (erroScreenshot) {
-      console.error(`Não foi possível salvar screenshot: ${erroScreenshot.message}`);
+      logErro(`Não foi possível salvar screenshot: ${erroScreenshot.message}`);
     }
   } finally {
     await context.close();
