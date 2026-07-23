@@ -1,42 +1,56 @@
 /**
  * buscar_boletos.js
  *
- * SIAET (DNIT) — Lote de download de boletos.
+ * SIAET (DNIT) — Lote de download de boletos, com gravação no Supabase.
  *
- * Descobre quais AETs têm boleto em aberto usando a tela
- * FINANCEIRO > Débitos (conDebitoTransportador.asp) e chama o
- * baixar_boleto.js para cada uma.
+ * Descobre quais AETs têm boleto em aberto pela tela
+ * FINANCEIRO > Débitos (conDebitoTransportador.asp), chama o
+ * baixar_boleto.js para cada uma, comprime o PDF com Ghostscript e
+ * registra o boleto na tabela `boletos` com boleto_anexado = true.
+ *
+ * Espelha a lógica do anexar_aets.js:
+ *   - autentica no Supabase via signInWithPassword
+ *   - controla o que falta pela flag boleto_anexado
+ *   - erro numa AET não interrompe o lote
+ *   - separa pendência de negócio (sem boleto disponível) de falha real
  *
  * POR QUE PARTIR DA TELA DE DÉBITOS:
  *   Ela lista as AETs com débito em aberto SEM exigir captcha — é só
  *   navegação de menu. Só se gasta captcha nas AETs que realmente têm
- *   boleto a baixar (um por AET, na manEmitirBoleto.asp). Varrer o
- *   banco inteiro tentando cada AET desperdiçaria OCR em massa, e o
- *   captcha dessa tela é justamente o de menor taxa de acerto.
+ *   boleto a baixar. Varrer o banco inteiro tentando cada AET
+ *   desperdiçaria OCR em massa, e o captcha dessa tela é justamente o
+ *   de menor taxa de acerto do sistema.
  *
  * ESTRUTURA DA TELA DE DÉBITOS (confirmada em HTML real):
  *   <table id="tblRelatorioDiario">
- *     linha de cabeçalho: AET Número | Tipo Débito | Data de Vencimento | Valor
- *     linhas de dados:    292712/2026 | Tarifa de AET | 23/07/2026 | 91,48
- *     linha final:        TOTAL (colspan=3) | 91,48
+ *     cabeçalho: AET Número | Tipo Débito | Data de Vencimento | Valor
+ *     dados:     292712/2026 | Tarifa de AET | 23/07/2026 | 91,48
+ *     rodapé:    TOTAL (colspan=3) | 91,48
  *
  *   O parser aceita apenas linhas cuja primeira célula bate com
- *   NNNNNN/AAAA — assim cabeçalho e TOTAL são descartados sozinhos,
- *   sem depender de índice de linha.
+ *   NNNNNN/AAAA — cabeçalho e TOTAL caem fora sozinhos, sem depender
+ *   de índice de linha.
  *
- *   ATENÇÃO: o HTML de referência é de um transportador SEM débitos
- *   impeditivos ("Transportador não possuí débitos impeditivos..."),
- *   então só uma tabela foi renderizada. Se houver débitos vencidos, o
- *   SIAET provavelmente renderiza uma segunda tabela. O seletor usa
- *   querySelectorAll, que captura TODAS as tabelas com esse id (ASP
- *   costuma repetir id), então os dois casos entram no lote. Vale
- *   confirmar com um HTML real de transportador com débito vencido.
+ *   ATENÇÃO: o HTML de referência é de transportador SEM débitos
+ *   impeditivos. Se houver débito vencido, o SIAET provavelmente
+ *   renderiza uma segunda tabela. O seletor usa querySelectorAll, que
+ *   captura TODAS as tabelas com esse id (ASP costuma repetir id), então
+ *   em tese os dois casos entram no lote — falta confirmar com um HTML
+ *   real de transportador com débito vencido.
  *
- * IDEMPOTÊNCIA:
- *   Antes de gastar captcha, verifica se o PDF já existe em disco e
- *   pula a AET. Use REBAIXAR=1 para forçar o download mesmo assim.
- *   (Não há integração com Supabase aqui — este script só baixa. A
- *   gravação em `boletos` fica para a camada de banco.)
+ * PREMISSA ATUAL: 1 boleto por AET.
+ *   Por isso a chave de upsert é o próprio aet_id, e o arquivo se chama
+ *   {numero}-{ano}.pdf. Se o SIAET trouxer mais de um link na mesma
+ *   tela, o baixar_boleto.js grava os extras com sufixo e este script
+ *   avisa no log — aí a premissa precisa ser revista com o cliente.
+ *
+ * PRÉ-REQUISITOS NO BANCO:
+ *   ALTER TABLE boletos DROP COLUMN url;
+ *   ALTER TABLE boletos ADD COLUMN boleto_anexado boolean DEFAULT false;
+ *   CREATE UNIQUE INDEX boletos_aet_id_key ON boletos (aet_id);
+ *
+ *   (a flag chama-se boleto_anexado aqui, e nao pdf_anexado como em
+ *   `aets`, para deixar explicito de qual artefato se trata)
  *
  * Uso:
  *   node scripts/buscar_boletos.js
@@ -48,7 +62,12 @@ require('dotenv').config({ path: require('path').resolve(__dirname, '..', '.env'
 
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
+
 const { chromium } = require('playwright');
+const { createClient } = require('@supabase/supabase-js');
 
 const { fazerLoginCompleto } = require('./siaet_login_completo.js');
 const { baixarBoleto } = require('./baixar_boleto.js');
@@ -59,6 +78,110 @@ const SELETOR_MENU_DEBITOS = 'a[href*="conDebitoTransportador.asp"]';
 
 const PASTA_BOLETOS = process.env.PASTA_PDFS_BOLETOS || '/app/pdfs/boletos';
 const REBAIXAR = process.env.REBAIXAR === '1';
+const GS_PRESET = '/ebook';
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_PUBLISHABLE_KEY);
+
+// ---------------------------------------------------------------
+// Supabase
+// ---------------------------------------------------------------
+
+async function autenticarSupabase() {
+  const { error } = await supabase.auth.signInWithPassword({
+    email: process.env.SUPABASE_AUTH_EMAIL,
+    password: process.env.SUPABASE_AUTH_PASSWORD,
+  });
+  if (error) throw new Error(`Falha ao autenticar no Supabase: ${error.message}`);
+}
+
+async function buscarAetPorNumero(numeroAet) {
+  const { data, error } = await supabase
+    .from('aets')
+    .select('id, numero_aet')
+    .eq('numero_aet', numeroAet)
+    .maybeSingle();
+
+  if (error) throw new Error(`Falha ao consultar AET ${numeroAet}: ${error.message}`);
+  return data; // null se não existir
+}
+
+async function buscarBoletoDaAet(aetId) {
+  const { data, error } = await supabase
+    .from('boletos')
+    .select('id, boleto_anexado, status')
+    .eq('aet_id', aetId)
+    .maybeSingle();
+
+  if (error) throw new Error(`Falha ao consultar boleto da AET: ${error.message}`);
+  return data;
+}
+
+// Upsert usando aet_id como chave de conflito (índice único criado no
+// pré-requisito). Assim reexecuções do lote atualizam a linha em vez de
+// duplicar — mesmo papel que o numero_aet cumpre na tabela aets.
+async function gravarBoleto(aetId, dados) {
+  const { error } = await supabase
+    .from('boletos')
+    .upsert(
+      {
+        aet_id: aetId,
+        valor: dados.valor,
+        data_vencimento: dados.dataVencimento,
+        boleto_anexado: true,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'aet_id' }
+    );
+
+  if (error) throw new Error(`Falha ao gravar boleto: ${error.message}`);
+}
+
+// ---------------------------------------------------------------
+// Conversões dos dados da tela (formato BR → formato do banco)
+// ---------------------------------------------------------------
+
+// "91,48" → 91.48   |   "1.234,56" → 1234.56
+function parseValor(texto) {
+  if (!texto) return 0;
+  const limpo = String(texto).replace(/\./g, '').replace(',', '.').replace(/[^\d.]/g, '');
+  const numero = parseFloat(limpo);
+  return Number.isFinite(numero) ? numero : 0;
+}
+
+// "23/07/2026" → "2026-07-23" (formato date do Postgres)
+function parseData(texto) {
+  const m = String(texto || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return null;
+  const [, dia, mes, ano] = m;
+  return `${ano}-${mes}-${dia}`;
+}
+
+function splitNumeroAet(numeroAet) {
+  const [numero, ano] = String(numeroAet).split('/');
+  if (!numero || !ano) {
+    throw new Error(`Formato inesperado de número de AET: "${numeroAet}"`);
+  }
+  return { numero, ano };
+}
+
+// ---------------------------------------------------------------
+// Compressão (mesma do anexar_aets.js)
+// ---------------------------------------------------------------
+
+async function comprimirPdf(caminhoOriginal) {
+  const caminhoTemp = caminhoOriginal.replace(/\.pdf$/, '.tmp.pdf');
+  await execFileAsync('gs', [
+    '-sDEVICE=pdfwrite',
+    '-dCompatibilityLevel=1.4',
+    `-dPDFSETTINGS=${GS_PRESET}`,
+    '-dNOPAUSE',
+    '-dQUIET',
+    '-dBATCH',
+    `-sOutputFile=${caminhoTemp}`,
+    caminhoOriginal,
+  ]);
+  fs.renameSync(caminhoTemp, caminhoOriginal);
+}
 
 // ---------------------------------------------------------------
 // Navegação até a tela de Débitos.
@@ -88,10 +211,6 @@ async function abrirTelaDeDebitos(page) {
   }
 }
 
-// ---------------------------------------------------------------
-// Parser da tabela de débitos
-// ---------------------------------------------------------------
-
 async function lerDebitos(page) {
   return page.$$eval(`${SELETOR_TABELA} tr`, (linhas) => {
     const resultado = [];
@@ -101,8 +220,6 @@ async function lerDebitos(page) {
         (td.innerText || '').replace(/\u00a0/g, ' ').trim()
       );
 
-      // Só interessam linhas cuja 1ª célula é um número de AET.
-      // Cabeçalho ("AET Número") e rodapé ("TOTAL") caem fora sozinhos.
       if (celulas.length < 4) continue;
       if (!/^\d+\/\d{4}$/.test(celulas[0])) continue;
 
@@ -118,14 +235,9 @@ async function lerDebitos(page) {
   });
 }
 
-// ---------------------------------------------------------------
-// Uma AET pode aparecer em mais de uma linha da tela de Débitos
-// (tarifas diferentes vencendo em datas diferentes). Como o
-// baixar_boleto.js já baixa TODOS os boletos com link da tela em uma
-// única visita, agrupamos por AET para não gastar dois captchas
-// buscando a mesma página duas vezes.
-// ---------------------------------------------------------------
-
+// Uma AET pode aparecer em mais de uma linha (tarifas distintas). Como
+// o baixar_boleto.js já pega todos os links da tela numa visita só,
+// agrupamos para não gastar dois captchas na mesma página.
 function agruparPorAet(debitos) {
   const mapa = new Map();
   for (const d of debitos) {
@@ -133,26 +245,6 @@ function agruparPorAet(debitos) {
     mapa.get(d.numeroAet).push(d);
   }
   return mapa;
-}
-
-function splitNumeroAet(numeroAet) {
-  const [numero, ano] = String(numeroAet).split('/');
-  if (!numero || !ano) {
-    throw new Error(`Formato inesperado de número de AET: "${numeroAet}"`);
-  }
-  return { numero, ano };
-}
-
-function jaBaixado(numero, ano) {
-  // Nome do caso simples (1 boleto). Se a AET tiver vários, o
-  // baixar_boleto.js grava com sufixo — por isso a checagem olha
-  // também por qualquer arquivo que comece com {numero}-{ano}.
-  if (fs.existsSync(path.join(PASTA_BOLETOS, `${numero}-${ano}.pdf`))) return true;
-
-  if (!fs.existsSync(PASTA_BOLETOS)) return false;
-  return fs
-    .readdirSync(PASTA_BOLETOS)
-    .some((arquivo) => arquivo.startsWith(`${numero}-${ano}-`) && arquivo.endsWith('.pdf'));
 }
 
 // ---------------------------------------------------------------
@@ -163,9 +255,16 @@ function jaBaixado(numero, ano) {
   fs.mkdirSync(PASTA_BOLETOS, { recursive: true });
 
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  // Contexto explícito: browser.newPage() cria um contexto "próprio"
+  // que recusa uma segunda página ("Please use browser.newContext()"),
+  // e o download do boleto precisa abrir uma aba extra.
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
   try {
+    console.log('Autenticando no Supabase...');
+    await autenticarSupabase();
+
     console.log('Fazendo login no SIAET...');
     await fazerLoginCompleto(page);
     console.log('Login concluído.');
@@ -193,6 +292,7 @@ function jaBaixado(numero, ano) {
     let sucesso = 0;
     let pulados = 0;
     let semBoleto = 0;
+    let semAet = 0;
     let falha = 0;
 
     for (let i = 0; i < aets.length; i++) {
@@ -202,24 +302,69 @@ function jaBaixado(numero, ano) {
       try {
         const { numero, ano } = splitNumeroAet(numeroAet);
 
-        if (!REBAIXAR && jaBaixado(numero, ano)) {
-          console.log(`${rotulo} — PDF já existe, pulando (REBAIXAR=1 para forçar).`);
-          pulados++;
+        // boletos.aet_id é NOT NULL: sem a AET no banco não há como
+        // gravar. Acontece se a tela de Débitos trouxer uma AET que o
+        // incrementar_aets.js ainda não sincronizou.
+        const aet = await buscarAetPorNumero(numeroAet);
+        if (!aet) {
+          semAet++;
+          console.log(`${rotulo} — AET não encontrada na tabela aets, pulando.`);
           continue;
+        }
+
+        if (!REBAIXAR) {
+          const boletoExistente = await buscarBoletoDaAet(aet.id);
+          if (boletoExistente?.boleto_anexado) {
+            pulados++;
+            console.log(`${rotulo} — já anexado, pulando (REBAIXAR=1 para forçar).`);
+            continue;
+          }
         }
 
         const tipos = linhas.map((l) => l.tipoDebito).filter(Boolean).join(', ');
         console.log(`${rotulo} — baixando (${tipos || 'tipo não informado'})...`);
 
         const resultado = await baixarBoleto(page, numero, ano, PASTA_BOLETOS);
-        sucesso += resultado.boletos.length;
+
+        if (resultado.boletos.length > 1) {
+          // Premissa de 1 boleto por AET violada: os arquivos extras
+          // foram gravados em disco, mas a tabela só guarda uma linha
+          // por aet_id. Fica registrado para revisão com o cliente.
+          console.warn(
+            `${rotulo} — ATENÇÃO: ${resultado.boletos.length} boletos nesta AET. ` +
+            `Todos os PDFs foram salvos, mas só um registro será gravado no banco.`
+          );
+        }
+
+        for (const b of resultado.boletos) {
+          const antes = fs.statSync(b.caminhoPdf).size;
+          await comprimirPdf(b.caminhoPdf);
+          const depois = fs.statSync(b.caminhoPdf).size;
+          console.log(
+            `   ${path.basename(b.caminhoPdf)} — ` +
+            `${(antes / 1024).toFixed(0)}KB → ${(depois / 1024).toFixed(0)}KB`
+          );
+        }
+
+        // Usa a primeira linha de débito como referência de valor e
+        // vencimento (com a premissa de 1 boleto, só existe uma).
+        await gravarBoleto(aet.id, {
+          valor: parseValor(linhas[0].valor),
+          dataVencimento: parseData(linhas[0].dataVencimento),
+        });
+
+        sucesso++;
+        console.log(`${rotulo} — concluído.`);
       } catch (erro) {
         if (erro.semBoletoDisponivel) {
-          // A tela de Débitos disse que há débito, mas a tela do boleto
-          // não trouxe link (ex: pagamento compensado entre uma tela e
+          // A tela de Débitos indicou débito, mas a tela do boleto não
+          // trouxe link (ex: pagamento compensado entre uma tela e
           // outra). Estado de negócio, não falha do robô.
           semBoleto++;
-          console.log(`${rotulo} — sem link de boleto: ${erro.situacao?.situacaoTarifa || 'sem detalhe'}`);
+          console.log(
+            `${rotulo} — sem link de boleto: ` +
+            `${erro.situacao?.situacaoTarifa || 'sem detalhe'}`
+          );
         } else {
           falha++;
           console.error(`${rotulo} — ERRO: ${erro.message}`);
@@ -228,9 +373,9 @@ function jaBaixado(numero, ano) {
     }
 
     console.log(
-      `\nFinalizado. Boletos baixados: ${sucesso} | ` +
-      `AETs puladas (já tinham PDF): ${pulados} | ` +
-      `Sem boleto disponível: ${semBoleto} | Falhas: ${falha}`
+      `\nFinalizado. Sucesso: ${sucesso} | Já anexados: ${pulados} | ` +
+      `Sem boleto disponível: ${semBoleto} | AET fora do banco: ${semAet} | ` +
+      `Falhas: ${falha}`
     );
   } catch (erro) {
     console.error(`Erro fatal: ${erro.message}`);

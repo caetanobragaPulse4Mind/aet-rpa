@@ -176,49 +176,60 @@ async function abrirTelaDoBoleto(page, numero, ano) {
 // ---------------------------------------------------------------
 // Download do PDF a partir de um link de boleto
 //
-// BoletoRegistrado.asp pode responder com o PDF direto ou com uma
-// página HTML do boleto. Em vez de assumir, o script inspeciona o
-// content-type e trata os dois casos:
-//   - application/pdf  → grava os bytes recebidos
-//   - text/html        → abre numa aba e gera o PDF via page.pdf()
+// CONFIRMADO: BoletoRegistrado.asp devolve HTML (não PDF). O código de
+// barras é montado com ~227 GIFs de 1px esticados, então a página
+// precisa ser RENDERIZADA por um browser de verdade — daí o page.pdf().
 //
-// A requisição sai por page.request, que compartilha os cookies do
-// contexto (a sessão do SIAET), com o Referer da própria tela — o
-// backend ASP do SIAET é sensível a Referer em várias telas.
+// Por que não usar page.request.get: o SIAET não envia a cadeia
+// completa do certificado. O Chromium aceita (usa o próprio CA store),
+// mas o APIRequestContext do Playwright usa o CA store do Node e falha
+// com "unable to get local issuer certificate". Abrir numa aba do
+// próprio browser reaproveita a sessão, os cookies e a confiança no
+// certificado que a navegação normal já tem.
 // ---------------------------------------------------------------
 
 async function baixarPdfDoLink(page, urlBoleto, caminhoPdf) {
-  const resposta = await page.request.get(urlBoleto, {
-    headers: { Referer: page.url() },
-  });
+  const aba = await page.context().newPage();
 
-  if (!resposta.ok()) {
-    throw new Error(
-      `BoletoRegistrado.asp respondeu HTTP ${resposta.status()} ${resposta.statusText()}`
-    );
-  }
+  // Se o endpoint algum dia passar a servir PDF puro, a navegação vira
+  // um download em vez de renderizar — este listener captura esse caso.
+  let download = null;
+  aba.on('download', (d) => { download = d; });
 
-  const tipo = (resposta.headers()['content-type'] || '').toLowerCase();
-
-  if (tipo.includes('pdf')) {
-    fs.writeFileSync(caminhoPdf, await resposta.body());
-    return 'pdf-direto';
-  }
-
-  if (tipo.includes('html')) {
-    // Boleto servido como página: abre numa aba nova (para não perder
-    // a tela atual) e imprime em PDF.
-    const abaBoleto = await page.context().newPage();
+  try {
     try {
-      await abaBoleto.goto(urlBoleto, { waitUntil: 'networkidle' });
-      await abaBoleto.pdf({ path: caminhoPdf, format: 'A4', printBackground: true });
-    } finally {
-      await abaBoleto.close();
+      await aba.goto(urlBoleto, { waitUntil: 'networkidle' });
+    } catch (erroNavegacao) {
+      // Quando a resposta é um download, o Chromium aborta a navegação.
+      // Qualquer outro erro é problema real e sobe.
+      const ehDownload = /ERR_ABORTED|Download is starting/i.test(erroNavegacao.message);
+      if (!ehDownload) throw erroNavegacao;
+      // dá um instante para o evento 'download' chegar
+      await aba.waitForTimeout(1000);
     }
-    return 'html-convertido';
-  }
 
-  throw new Error(`Content-Type inesperado em BoletoRegistrado.asp: "${tipo}"`);
+    if (download) {
+      await download.saveAs(caminhoPdf);
+      return 'pdf-direto';
+    }
+
+    // Caso confirmado hoje: HTML. Esconde o botão "Imprimir" do próprio
+    // site para ele não aparecer no PDF gerado.
+    await aba.addStyleTag({
+      content: 'img[src*="botao_imprimir"] { display: none !important; }',
+    }).catch(() => {});
+
+    await aba.pdf({
+      path: caminhoPdf,
+      format: 'A4',
+      printBackground: true,
+      margin: { top: '8mm', bottom: '8mm', left: '8mm', right: '8mm' },
+    });
+
+    return 'html-convertido';
+  } finally {
+    await aba.close();
+  }
 }
 
 // ---------------------------------------------------------------
@@ -309,7 +320,11 @@ if (require.main === module) {
     }
 
     const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
+    // Contexto explícito: browser.newPage() cria um contexto "próprio"
+    // que recusa uma segunda página ("Please use browser.newContext()"),
+    // e o download do boleto precisa abrir uma aba extra.
+    const context = await browser.newContext();
+    const page = await context.newPage();
 
     try {
       console.log('Fazendo login no SIAET...');
